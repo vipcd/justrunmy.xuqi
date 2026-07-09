@@ -25,7 +25,12 @@ jobs:
       JUSTRUNMY_PASSWORD: ${{ secrets.JUSTRUNMY_PASSWORD }}
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
       TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-      HY2_PROXY_URL: ${{ secrets.HY2_PROXY_URL }}
+      
+      # SSH 隧道中转节点代理配置
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PASS: ${{ secrets.SSH_PASS }}
       SOCKS_PORT: ${{ secrets.SOCKS_PORT || '51080' }}
       
       # ========== 项目配置 ==========
@@ -44,11 +49,11 @@ jobs:
         with:
           python-version: 3.11
 
-      # 步骤 3: 安装系统依赖
+      # 步骤 3: 安装系统依赖 (升级安装 sshpass 与 openssh-client 依赖库)
       - name: 📦 安装系统依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb xdotool scrot fonts-noto-cjk
+          sudo apt-get install -y xvfb xdotool scrot fonts-noto-cjk sshpass openssh-client
 
       # 步骤 4: 安装 Python 依赖
       - name: 📚 安装 Python 依赖
@@ -56,19 +61,14 @@ jobs:
           pip install --upgrade pip
           pip install seleniumbase aiohttp requests
 
-      # 步骤 5: 安装 Hysteria2（如果需要代理）
-      - name: 📡 安装 Hysteria2
+      # 步骤 5: 校验 SSH 动态隧道直连配置状态
+      - name: 📡 校验 SSH 隧道直连配置状态
         run: |
-          if [ -n "${{ env.HY2_PROXY_URL }}" ]; then
-            echo "安装 Hysteria2..."
-            curl -L -o hysteria \
-              https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64
-            chmod +x hysteria
-            sudo mv hysteria /usr/local/bin/hysteria
-            hysteria version
-            echo "✅ Hysteria2 安装完成"
+          if [ -n "${{ env.SSH_HOST }}" ]; then
+            echo "✅ 成功识别到 SSH 动态安全中转节点: ${{ env.SSH_HOST }}"
+            echo "脚本在启动时将自动通过 sshpass 呼叫后台动态代理网络。"
           else
-            echo "⚠️ 未配置代理，跳过 Hysteria2 安装"
+            echo "⚠️ 未找到任何 SSH 主机配置，当前处于 Actions 机房裸奔直连模式。"
           fi
 
       # 步骤 6: 随机延迟 0-10 分钟
@@ -78,14 +78,17 @@ jobs:
           echo "💤 随机延迟 ${DELAY} 秒（最多 10 分钟）"
           sleep $DELAY
 
-      # 步骤 7: 执行脚本
+      # 步骤 7: 执行脚本 (注入全新 SSH 安全中转环境变量)
       - name: 🚀 运行续期脚本
         env:
           JUSTRUNMY_EMAIL: ${{ env.JUSTRUNMY_EMAIL }}
           JUSTRUNMY_PASSWORD: ${{ env.JUSTRUNMY_PASSWORD }}
           TG_BOT_TOKEN: ${{ env.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ env.TG_CHAT_ID }}
-          HY2_PROXY_URL: ${{ env.HY2_PROXY_URL }}
+          SSH_HOST: ${{ env.SSH_HOST }}
+          SSH_PORT: ${{ env.SSH_PORT }}
+          SSH_USER: ${{ env.SSH_USER }}
+          SSH_PASS: ${{ env.SSH_PASS }}
           SOCKS_PORT: ${{ env.SOCKS_PORT }}
         run: |
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" \
@@ -125,7 +128,7 @@ jobs:
             echo "✅ 更改已推送"
           fi
 
-      # 步骤 11: 清理旧的工作流运行记录
+      # 步骤 11: 始终只保留最近 2 条记录 (根据您的配置偏好严格清理历史)
       - name: 🧹 清理旧的工作流运行记录
         uses: Mattraks/delete-workflow-runs@v2
         with:
@@ -133,4 +136,4 @@ jobs:
           repository: ${{ github.repository }}
           delete_workflow_pattern: ${{ github.workflow }}
           retain_days: 0
-          keep_minimum_runs: 3
+          keep_minimum_runs: 2
