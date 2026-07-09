@@ -24,10 +24,13 @@ PASSWORD     = os.environ.get("JUSTRUNMY_PASSWORD")
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID")
 
-# Hysteria2 代理 URL（可选）
-HY2_PROXY_URL = os.environ.get("HY2_PROXY_URL", "")
+# SSH 代理直连配置
+SSH_HOST     = os.environ.get("SSH_HOST", "")
+SSH_PORT     = int(os.environ.get("SSH_PORT", "22"))
+SSH_USER     = os.environ.get("SSH_USER", "")
+SSH_PASS     = os.environ.get("SSH_PASS", "")
 
-# SOCKS5 代理端口（可选，默认 51080）
+# SOCKS5 代理端口（默认 51080）
 SOCKS_PORT = int(os.environ.get("SOCKS_PORT", "51080"))
 
 if not EMAIL or not PASSWORD:
@@ -42,108 +45,93 @@ DYNAMIC_APP_NAME = "未知应用"
 CURRENT_IP_INFO = "未知 IP"
 
 # ============================================================
-#  Hysteria2 代理模块
+#  SSH 隧道直连代理模块
 # ============================================================
-class Hy2Proxy:
-    def __init__(self, url):
-        self.url = url
+class SshProxy:
+    def __init__(self, host, port, user, password):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
         self.proc = None
 
     def start(self):
-        if not self.url:
-            print("⚠️ 未提供 HY2_PROXY_URL")
+        if not self.host or not self.user:
+            print("⚠️ 未提供完整的 SSH 配置")
             return False
 
-        print("📡 启动 Hysteria2...")
+        print(f"📡 正在建立 SSH 动态直连隧道 (SOCKS5 代理代理映射)...")
+        print(f"🔗 目标节点: {self.user}@{self.host}:{self.port}")
 
-        u = self.url.replace("hysteria2://", "").replace("hy2://", "")
-        parsed = urlparse("scheme://" + u)
-        params = parse_qs(parsed.query)
-
-        # 处理 IPv6 地址
-        hostname = parsed.hostname
-        port = parsed.port
-
-        # IPv6 地址需要用方括号包围
-        if hostname and ':' in hostname:
-            server = f"[{hostname}]:{port}"
-        else:
-            server = f"{hostname}:{port}"
-
-        cfg = {
-            "server": server,
-            "auth": unquote(parsed.username),
-            "tls": {
-                "sni": params.get("sni", [hostname])[0],
-                "insecure": params.get("insecure", ["0"])[0] == "1",
-                "alpn": params.get("alpn", ["h3"])[0],
-            },
-            "socks5": {"listen": f"127.0.0.1:{SOCKS_PORT}"}
-        }
-
-        path = "/tmp/hy2.json"
-        with open(path, "w") as f:
-            json.dump(cfg, f)
+        # 使用 sshpass 配合 ssh -N -D 命令在后台静默建立隧道
+        cmd = [
+            "sshpass", "-p", self.password,
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=15",
+            "-N", "-D", f"127.0.0.1:{SOCKS_PORT}",
+            "-p", str(self.port),
+            f"{self.user}@{self.host}"
+        ]
 
         self.proc = subprocess.Popen(
-            ["hysteria", "client", "-c", path],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
             text=True
         )
 
+        # 循环检测本地转发端口是否成功开放就绪
         for _ in range(30):
             time.sleep(1)
             with socket.socket() as s:
                 if s.connect_ex(("127.0.0.1", SOCKS_PORT)) == 0:
-                    print("✅ HY2 已就绪")
+                    print("✅ SSH 动态直连隧道已就绪！")
                     break
         else:
-            print("❌ HY2 启动失败")
+            print("❌ SSH 隧道启动失败或超时，请检查您的主机 Secrets 配置以及网络连通性。")
             try:
                 _, stderr = self.proc.communicate(timeout=1)
                 if stderr:
-                    print(f"HY2 错误: {stderr}")
+                    print(f"SSH 错误信息: {stderr}")
             except Exception:
                 pass
             return False
 
-        time.sleep(3)
+        time.sleep(2)
         return True
 
     def stop(self):
         if self.proc:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-            print("🛑 HY2 已停止")
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+                print("🛑 SSH 隧道已安全关闭")
+            except Exception:
+                pass
 
     @property
     def proxy(self):
         return f"socks5://127.0.0.1:{SOCKS_PORT}"
 
 
-def get_proxy_manager() -> Optional[Hy2Proxy]:
-    """
-    根据环境变量判断是否需要使用代理
-    支持的环境变量：
-      - HY2_PROXY_URL: Hysteria2 代理 URL
-    返回代理管理器或 None
-    """
-    if HY2_PROXY_URL:
-        return Hy2Proxy(HY2_PROXY_URL)
+def get_proxy_manager() -> Optional[SshProxy]:
+    """根据环境变量判断是否需要启动并挂载 SSH 隧道代理"""
+    if SSH_HOST and SSH_USER:
+        return SshProxy(SSH_HOST, SSH_PORT, SSH_USER, SSH_PASS)
     return None
 
 
 def mask_ip(ip: str) -> str:
     """脱敏 IP 地址"""
+    if not ip or "." not in ip:
+        return ip
     return ip.rsplit(".", 1)[0] + ".***"
 
 
 def mask_email(email: str) -> str:
-    """
-    脱敏邮箱地址，保留首尾字母，中间用 * 代替，@ 及后面不脱敏
-    例: user@example.com -> u***r@example.com
-    """
+    """脱敏邮箱地址"""
     if "@" not in email:
         if len(email) <= 2:
             return email
@@ -169,20 +157,16 @@ def check_ip(proxy: Optional[str] = None) -> str:
         ).json()
         if r.get("status") == "success":
             ip_str = f"{mask_ip(r['query'])} ({r['countryCode']})"
-            mode = "✅ 代理" if proxy else "⚠️ 直连"
+            mode = "✅ SSH 代理" if proxy else "⚠️ 直连"
             return f"{ip_str} [{mode}]"
     except Exception:
         pass
-    mode = "✅ 代理" if proxy else "⚠️ 直连"
+    mode = "✅ SSH 代理" if proxy else "⚠️ 直连"
     return f"未知 IP [{mode}]"
 
 
 def start_proxy_with_retry(max_retries=3):
-    """
-    启动代理，失败时重试
-    参数: max_retries - 最大重试次数（默认 3 次）
-    返回: (proxy_manager, proxy_url) 或 (None, None)
-    """
+    """启动代理，失败时重试"""
     proxy_manager = get_proxy_manager()
     proxy_url = None
 
@@ -190,17 +174,17 @@ def start_proxy_with_retry(max_retries=3):
         return None, None
 
     for attempt in range(1, max_retries + 1):
-        print(f"🔄 尝试启动代理 ({attempt}/{max_retries})...")
+        print(f"🔄 尝试启动 SSH 动态隧道 ({attempt}/{max_retries})...")
         if proxy_manager.start():
             proxy_url = proxy_manager.proxy
-            print(f"✅ 代理已启动：{proxy_url}")
+            print(f"✅ 代理已成功挂载：{proxy_url}")
             return proxy_manager, proxy_url
         else:
             if attempt < max_retries:
                 print(f"⏳ 等待 5 秒后重试...")
                 time.sleep(5)
             else:
-                print("⚠️ 代理启动失败，继续使用直连模式")
+                print("⚠️ SSH 隧道多次启动失败，继续使用默认环境直连模式。")
 
     return None, None
 
@@ -213,15 +197,12 @@ def send_tg_message(status_icon, status_text, time_left):
         print("ℹ️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过 Telegram 推送。")
         return
 
-    # 获取北京时间 (UTC+8)
     local_time = time.gmtime(time.time() + 8 * 3600)
     current_time_str = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
 
-    # 脱敏邮箱，构造账号超链接
     masked = mask_email(EMAIL)
     account_line = f"<a href='tg://user?id={TG_CHAT_ID}'>{masked}</a>"
 
-    # 按照格式拼接消息，动态注入抓取到的应用名称
     text = (
         f"🎮 justrunmy.app 续期报告\n🖥 {DYNAMIC_APP_NAME}\n"
         f"👤 账号: {account_line}\n"
@@ -325,7 +306,7 @@ _WININFO_JS = """
 """
 
 # ============================================================
-#  底层输入工具
+#  底层输入工具与多重行为模拟引擎
 # ============================================================
 def js_fill_input(sb, selector: str, text: str):
     safe_text = text.replace('\\', '\\\\').replace('"', '\\"')
@@ -360,19 +341,64 @@ def _activate_window():
     except Exception:
         pass
 
-def _xdotool_click(x: int, y: int):
+def _xdotool_click(x: int, y: int, penetration_mode: bool = False):
+    """
+    底层模拟点击内核
+    penetration_mode 为 True 时激活底层击穿模式：模拟人类非线性滑动鼠标轨迹 + 物理长按延时松开
+    """
     _activate_window()
-    try:
-        subprocess.run(["xdotool", "mousemove", "--sync", str(x), str(y)], timeout=3, stderr=subprocess.DEVNULL)
-        time.sleep(0.15)
-        subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
-    except Exception:
-        os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
+    import random
+    
+    if penetration_mode:
+        print(f"  ⚡ [底层击穿模式激活] 正在为您模拟人类鼠标变速平滑轨迹滑动...")
+        try:
+            # 读取当前鼠标位置
+            res = subprocess.run(["xdotool", "getmouselocation", "--shell"], capture_output=True, text=True, timeout=2)
+            lines = res.stdout.strip().split("\n")
+            curr_x = int(lines[0].split("=")[1])
+            curr_y = int(lines[1].split("=")[1])
+        except Exception:
+            curr_x, curr_y = 0, 0
+
+        # 为目标坐标引入人类操作产生的微幅像素物理随机抖动
+        target_x = x + random.randint(-4, 4)
+        target_y = y + random.randint(-4, 4)
+
+        # 步进式非线性拟合滑动
+        steps = random.randint(15, 25)
+        for i in range(1, steps + 1):
+            t = i / steps
+            t = t * t * (3 - 2 * t)  # 人类特征：渐入渐出变速曲线优化
+            next_x = int(curr_x + (target_x - curr_x) * t + random.randint(-1, 1))
+            next_y = int(curr_y + (target_y - curr_y) * t + random.randint(-1, 1))
+            subprocess.run(["xdotool", "mousemove", str(next_x), str(next_y)], stderr=subprocess.DEVNULL)
+            time.sleep(random.uniform(0.01, 0.02))
+
+        # 终点校正与停顿
+        subprocess.run(["xdotool", "mousemove", str(target_x), str(target_y)], stderr=subprocess.DEVNULL)
+        time.sleep(random.uniform(0.12, 0.25))
+
+        # 拟真长按点击（按下 -> 产生真实接触时长 -> 弹起）
+        subprocess.run(["xdotool", "mousedown", "1"], stderr=subprocess.DEVNULL)
+        time.sleep(random.uniform(0.07, 0.16))
+        subprocess.run(["xdotool", "mouseup", "1"], stderr=subprocess.DEVNULL)
+        print(f"  🎯 击穿点击执行完毕，随机模拟坐标落点: ({target_x}, {target_y})")
+    else:
+        # 常规轻度伪装点击：直接位移但附带随机边缘像素点
+        rx = x + random.randint(-2, 2)
+        ry = y + random.randint(-2, 2)
+        print(f"  🖱️ 物理级常规点击 Turnstile 坐标: ({rx}, {ry})")
+        try:
+            subprocess.run(["xdotool", "mousemove", "--sync", str(rx), str(ry)], timeout=3, stderr=subprocess.DEVNULL)
+            time.sleep(random.uniform(0.1, 0.2))
+            subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
+        except Exception:
+            os.system(f"xdotool mousemove {rx} {ry} click 1 2>/dev/null")
 
 # ============================================================
 #  人机验证处理
 # ============================================================
-def _click_turnstile(sb):
+def _click_turnstile(sb, penetration_mode: bool = False):
     try:
         coords = sb.execute_script(_COORDS_JS)
     except Exception as e:
@@ -389,11 +415,12 @@ def _click_turnstile(sb):
     bar = wi["oh"] - wi["ih"]
     ax  = coords["cx"] + wi["sx"]
     ay  = coords["cy"] + wi["sy"] + bar
-    print(f"  🖱️ 物理级点击 Turnstile ({ax}, {ay})")
-    _xdotool_click(ax, ay)
+    
+    _xdotool_click(ax, ay, penetration_mode=penetration_mode)
 
 def handle_turnstile(sb) -> bool:
     print("🔍 处理 Cloudflare Turnstile 验证...")
+    import random
     time.sleep(2)
     
     if sb.execute_script(_SOLVED_JS):
@@ -413,10 +440,13 @@ def handle_turnstile(sb) -> bool:
         except Exception: pass
         time.sleep(0.3)
         
-        _click_turnstile(sb)
+        # 👑 击穿逻辑切换：前 2 次点击不成功时，从第 3 次开始自动全面激活“底层击穿模式”
+        penetration_mode = (attempt >= 2)
+        _click_turnstile(sb, penetration_mode=penetration_mode)
         
+        # 散列轮询等待，随机化间歇，防频率审查
         for _ in range(8):
-            time.sleep(0.5)
+            time.sleep(random.uniform(0.4, 0.6))
             if sb.execute_script(_SOLVED_JS):
                 print(f"  ✅ Turnstile 通过（第 {attempt + 1} 次尝试）")
                 return True
@@ -499,13 +529,10 @@ def renew(sb) -> bool:
 
     print("🖱️ 自动读取应用名称...")
     try:
-        # 等待带有 font-semibold 的 h3 标签加载
         sb.wait_for_element('h3.font-semibold', timeout=10)
-        # 从网页中抓取真实的名称并保存到全局变量
         DYNAMIC_APP_NAME = sb.get_text('h3.font-semibold')
         print(f"🎯 成功抓取到应用名称: {DYNAMIC_APP_NAME}")
         
-        # 直接点击刚才抓取到的元素
         sb.click('h3.font-semibold')
         time.sleep(3)
         print(f"📍 成功进入应用详情页: {sb.get_current_url()}")
@@ -550,7 +577,6 @@ def renew(sb) -> bool:
     try:
         sb.refresh()
         time.sleep(4)
-        # 根据页面结构获取剩余时间文本
         timer_text = sb.get_text('span.font-mono.text-xl')
         print(f"⏱️ 当前应用剩余时间: {timer_text}")
         
@@ -575,35 +601,34 @@ def renew(sb) -> bool:
 # ============================================================
 def main():
     print("=" * 50)
-    print("   JustRunMy.app 自动登录与续期脚本")
+    print("   JustRunMy.app 自动登录与续期脚本 (SSH 动态直连升级版)")
     print("=" * 50)
 
-    # 启动 Hysteria2 代理（带重试），若未配置则直连
+    # 启动后台 SSH 隧道代理（带重试），若未配置则直连
     proxy_manager, proxy_url = start_proxy_with_retry(max_retries=5)
 
-    # 检查落地 IP
+    # 检查落地 IP 信息
     print(f"🔍 正在检查 IP 信息（使用代理: {bool(proxy_url)})...")
     ip_info = check_ip(proxy_url)
     print(f"🌐 IP 信息：{ip_info}")
 
-    # 写入全局变量，供 send_tg_message 使用
     global CURRENT_IP_INFO
     CURRENT_IP_INFO = ip_info
 
     sb_kwargs = {"uc": True, "test": True, "headless": False}
 
     if proxy_url:
-        print(f"🔗 挂载代理: {proxy_url}")
+        print(f"🔗 挂载隧道代理至浏览器后端: {proxy_url}")
         sb_kwargs["proxy"] = proxy_url
     else:
-        print("🌐 未使用代理，直连访问")
+        print("🌐 未配置安全隧道，正在使用默认 Actions 裸奔直连访问")
 
     try:
         with SB(**sb_kwargs) as sb:
-            print("✅ 浏览器已启动")
+            print("✅ 自动化安全浏览器已成功拉起")
             try:
                 sb.open("https://api.ipify.org/?format=json")
-                print(f"🌐 当前出口真实 IP: {sb.get_text('body')}")
+                print(f"🌐 浏览器端实测出口真实 IP: {sb.get_text('body')}")
             except Exception:
                 pass
 
