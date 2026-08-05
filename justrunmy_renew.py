@@ -167,10 +167,11 @@ def human_cdp_click(sb, click_x, click_y):
     })
 
 
-def click_element_like_human(sb, selector):
+def click_element_like_human(sb, target):
     """对普通页面按钮执行带鼠标轨迹的原生坐标点击。"""
+    element = None
     try:
-        element = sb.find_element(selector)
+        element = sb.find_element(target) if isinstance(target, str) else target
         sb.driver.execute_script(
             "arguments[0].scrollIntoView({block:'center', inline:'center'});", element
         )
@@ -185,10 +186,108 @@ def click_element_like_human(sb, selector):
                 rect["left"] + rect["width"] / 2,
                 rect["top"] + rect["height"] / 2,
             )
-            return
+            return True
     except Exception as exc:
-        print(f"⚠️ 原生坐标点击失败，回退 WebDriver 点击: {exc}")
-    sb.click(selector)
+        print(f"⚠️ 原生坐标点击失败: {exc}")
+
+    print("↪️ 回退 WebDriver 元素点击。")
+    try:
+        if element is not None:
+            element.click()
+        else:
+            sb.click(target)
+        return True
+    except Exception as exc:
+        print(f"⚠️ WebDriver 点击也失败: {exc}")
+        return False
+
+
+def find_just_reset_button(sb, timeout=10):
+    """兼容 button、role=button、input、链接和开放 Shadow DOM。"""
+    upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    lower = "abcdefghijklmnopqrstuvwxyz"
+    xpaths = [
+        f"//button[contains(translate(normalize-space(string(.)), '{upper}', '{lower}'), 'just reset')]",
+        f"//*[@role='button' and contains(translate(normalize-space(string(.)), '{upper}', '{lower}'), 'just reset')]",
+        f"//input[contains(translate(normalize-space(@value), '{upper}', '{lower}'), 'just reset')]",
+        f"//a[contains(translate(normalize-space(string(.)), '{upper}', '{lower}'), 'just reset')]",
+    ]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for xpath in xpaths:
+            try:
+                for element in sb.driver.find_elements("xpath", xpath):
+                    if element.is_displayed():
+                        return element
+            except Exception:
+                pass
+
+        # XPath 找不到时，递归扫描开放的 Shadow DOM。
+        try:
+            element = sb.execute_script("""
+                const wanted = 'just reset';
+                function findIn(root) {
+                    const all = root.querySelectorAll('*');
+                    for (const el of all) {
+                        const tag = (el.tagName || '').toLowerCase();
+                        const role = (el.getAttribute && el.getAttribute('role')) || '';
+                        const candidate = tag === 'button' || tag === 'a' ||
+                            tag === 'input' || role.toLowerCase() === 'button';
+                        if (candidate) {
+                            const text = (el.innerText || el.value || el.textContent || '')
+                                .replace(/\\s+/g, ' ').trim().toLowerCase();
+                            const r = el.getBoundingClientRect();
+                            const visible = r.width > 0 && r.height > 0 &&
+                                getComputedStyle(el).visibility !== 'hidden' &&
+                                getComputedStyle(el).display !== 'none';
+                            if (visible && text.includes(wanted)) return el;
+                        }
+                        if (el.shadowRoot) {
+                            const found = findIn(el.shadowRoot);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                }
+                return findIn(document);
+            """)
+            if element:
+                return element
+        except Exception:
+            pass
+        time.sleep(0.4)
+    return None
+
+
+def save_page_diagnostics(sb, name):
+    """保存 HTML，并在日志中输出当前可见按钮文字，方便定位页面变化。"""
+    try:
+        html_path = SCREENSHOT_DIR / f"{name}.html"
+        html_path.write_text(sb.get_page_source() or "", encoding="utf-8")
+        print(f"🧾 页面 HTML 已保存: {html_path}")
+    except Exception as exc:
+        print(f"⚠️ HTML 诊断保存失败: {exc}")
+
+    try:
+        controls = sb.execute_script("""
+            return Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], a'))
+                .filter(el => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 &&
+                        getComputedStyle(el).display !== 'none' &&
+                        getComputedStyle(el).visibility !== 'hidden';
+                })
+                .map(el => ({
+                    tag: el.tagName,
+                    text: (el.innerText || el.value || el.textContent || '').replace(/\\s+/g, ' ').trim(),
+                    disabled: !!el.disabled
+                }))
+                .filter(item => item.text)
+                .slice(0, 40);
+        """) or []
+        print(f"🔎 当前可见操作控件: {controls}")
+    except Exception as exc:
+        print(f"⚠️ 无法读取可见控件: {exc}")
 
 
 def run_gui_captcha_click(sb):
@@ -322,18 +421,39 @@ def main():
                     continue
 
                 click_element_like_human(sb, reset)
-                print("✅ 已原生点击 Reset timer，等待续期弹窗和 Cloudflare 渲染...")
-                sb.sleep(4)
-                save_shot(sb, f"renew_confirmation_opened_{attempt}.png")
+                print("✅ 已点击 Reset timer，正在确认续期弹窗是否真的打开...")
+                sb.sleep(2)
 
+                # CDP 坐标点击在 Xvfb 中偶尔会因窗口装饰/缩放产生偏移。
+                # 如果看不到 Just Reset，立即使用 WebDriver 再点击一次 Reset timer。
+                confirm_element = find_just_reset_button(sb, 3)
+                if not confirm_element:
+                    print("⚠️ 第一次坐标点击后未发现 Just Reset，回退 WebDriver 点击 Reset timer...")
+                    try:
+                        sb.click(reset)
+                    except Exception as exc:
+                        print(f"⚠️ Reset timer WebDriver 回退点击失败: {exc}")
+                    sb.sleep(4)
+                    confirm_element = find_just_reset_button(sb, 5)
+
+                save_shot(sb, f"renew_confirmation_opened_{attempt}.png")
+                if not confirm_element:
+                    save_page_diagnostics(sb, f"reset_modal_not_open_{attempt}")
+                    last_error = "点击 Reset timer 后续期弹窗未打开，因此页面上不存在 Just Reset 按钮"
+                    print(f"⚠️ {last_error}")
+                    continue
+
+                print("✅ 已确认续期弹窗打开，并找到 Just Reset 按钮。")
                 token_ready = force_cdp_click_cf(sb)
                 if not token_ready:
                     print("⚠️ 本地未读取到 Token，但继续点击 Just Reset 让服务端进行最终校验。")
 
-                confirm_btn = first_visible(sb, [confirm_xpath], 12)
+                # Turnstile 渲染或刷新可能替换弹窗 DOM，因此提交前重新定位按钮。
+                confirm_btn = find_just_reset_button(sb, 12)
                 if not confirm_btn:
                     save_shot(sb, f"confirm_btn_not_found_{attempt}.png")
-                    last_error = "未找到 Just Reset 按钮"
+                    save_page_diagnostics(sb, f"confirm_btn_not_found_{attempt}")
+                    last_error = "续期弹窗曾打开，但 Turnstile 处理后未找到 Just Reset 按钮"
                     continue
 
                 print("👉 正在以原生鼠标事件点击 Just Reset...")
@@ -367,7 +487,7 @@ def main():
                         break
 
                     try:
-                        visible = sb.is_element_visible(confirm_btn)
+                        visible = confirm_btn.is_displayed()
                     except Exception:
                         visible = False
                     if not visible:
