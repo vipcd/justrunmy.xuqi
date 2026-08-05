@@ -420,21 +420,27 @@ def main():
                     last_error = "找不到 Reset timer 按钮"
                     continue
 
-                click_element_like_human(sb, reset)
-                print("✅ 已点击 Reset timer，正在确认续期弹窗是否真的打开...")
-                sb.sleep(2)
-
-                # CDP 坐标点击在 Xvfb 中偶尔会因窗口装饰/缩放产生偏移。
-                # 如果看不到 Just Reset，立即使用 WebDriver 再点击一次 Reset timer。
-                confirm_element = find_just_reset_button(sb, 3)
-                if not confirm_element:
-                    print("⚠️ 第一次坐标点击后未发现 Just Reset，回退 WebDriver 点击 Reset timer...")
+                # 第一步只负责可靠地打开弹窗。Reset timer 是普通页面按钮，
+                # 不需要用坐标猜测；Turnstile 和 Just Reset 才使用真人式鼠标事件。
+                print("👉 第一步：点击页面上的 Reset timer，打开续期弹窗...")
+                try:
+                    sb.scroll_to(reset)
+                    sb.click(reset)
+                except Exception as exc:
+                    print(f"⚠️ WebDriver 点击 Reset timer 失败，尝试 JS 点击: {exc}")
                     try:
-                        sb.click(reset)
-                    except Exception as exc:
-                        print(f"⚠️ Reset timer WebDriver 回退点击失败: {exc}")
+                        sb.js_click(reset)
+                    except Exception as js_exc:
+                        print(f"⚠️ JS 点击 Reset timer 也失败: {js_exc}")
+
+                sb.sleep(3)
+                confirm_element = find_just_reset_button(sb, 6)
+                if not confirm_element:
+                    # 少数页面动画/遮罩可能拦截第一次点击，最后再用真人坐标补点一次。
+                    print("⚠️ 弹窗尚未出现，补充一次原生坐标点击 Reset timer...")
+                    click_element_like_human(sb, reset)
                     sb.sleep(4)
-                    confirm_element = find_just_reset_button(sb, 5)
+                    confirm_element = find_just_reset_button(sb, 6)
 
                 save_shot(sb, f"renew_confirmation_opened_{attempt}.png")
                 if not confirm_element:
@@ -444,6 +450,7 @@ def main():
                     continue
 
                 print("✅ 已确认续期弹窗打开，并找到 Just Reset 按钮。")
+                print("👉 第二步：点击弹窗中的 Cloudflare 真人验证框...")
                 token_ready = force_cdp_click_cf(sb)
                 if not token_ready:
                     print("⚠️ 本地未读取到 Token，但继续点击 Just Reset 让服务端进行最终校验。")
@@ -456,7 +463,7 @@ def main():
                     last_error = "续期弹窗曾打开，但 Turnstile 处理后未找到 Just Reset 按钮"
                     continue
 
-                print("👉 正在以原生鼠标事件点击 Just Reset...")
+                print("👉 第三步：正在以原生鼠标事件点击 Just Reset...")
                 click_element_like_human(sb, confirm_btn)
 
                 disappeared_since = None
