@@ -351,58 +351,137 @@ def save_page_diagnostics(sb, name):
         print(f"⚠️ 无法读取可见控件: {exc}")
 
 
-def run_gui_captcha_click(sb):
-    """调用 SeleniumBase 官方 GUI 验证码点击能力作为坐标点击的补充。"""
-    for method_name in ("uc_gui_click_cf", "uc_gui_click_captcha", "solve_captcha"):
-        method = getattr(sb, method_name, None)
-        if callable(method):
-            try:
-                print(f"🖱️ 调用 SeleniumBase {method_name}() 点击验证框...")
-                method()
-                time.sleep(1)
-                ensure_driver_connected(sb, 1)
-                return True
-            except Exception as exc:
-                print(f"⚠️ {method_name}() 执行失败: {exc}")
+def wait_for_turnstile_token(sb, timeout, label):
+    """等待 Turnstile 将验证结果写入隐藏响应控件。"""
+    for second in range(timeout):
+        time.sleep(1)
+        token = get_turnstile_token(sb)
+        if token:
+            print(f"🎉 {label}验证通过，{second + 1} 秒后捕获 Token（长度 {len(token)}）。")
+            return True
     return False
 
 
+def native_gui_click_turnstile(sb, rect):
+    """按 DOM 精确坐标换算屏幕坐标，断开 WebDriver 后用 PyAutoGUI 真鼠标点击。"""
+    checkbox_offset = min(30.0, max(22.0, float(rect["width"]) * 0.08))
+    viewport_x = float(rect["left"]) + checkbox_offset
+    viewport_y = float(rect["top"]) + float(rect["height"]) / 2
+    metrics = execute_value_script(sb, """
+        return {
+            screenX: window.screenX || 0,
+            screenY: window.screenY || 0,
+            outerWidth: window.outerWidth || window.innerWidth,
+            outerHeight: window.outerHeight || window.innerHeight,
+            innerWidth: window.innerWidth,
+            innerHeight: window.innerHeight,
+            dpr: window.devicePixelRatio || 1
+        };
+    """) or {}
+    border_x = max(0.0, (float(metrics.get("outerWidth", 0)) -
+                         float(metrics.get("innerWidth", 0))) / 2.0)
+    browser_top = max(0.0, float(metrics.get("outerHeight", 0)) -
+                      float(metrics.get("innerHeight", 0)))
+    screen_x = float(metrics.get("screenX", 0)) + border_x + viewport_x
+    screen_y = float(metrics.get("screenY", 0)) + browser_top + viewport_y
+    print(
+        f"📍 Turnstile 视口坐标 X={viewport_x:.1f}, Y={viewport_y:.1f}；"
+        f"屏幕坐标 X={screen_x:.1f}, Y={screen_y:.1f}"
+    )
+
+    clicker = getattr(sb.driver, "uc_gui_click_x_y", None)
+    if not callable(clicker):
+        raise RuntimeError("当前 SeleniumBase 驱动没有 uc_gui_click_x_y()")
+
+    try:
+        sb.driver.switch_to.window(sb.driver.current_window_handle)
+    except Exception:
+        pass
+    time.sleep(random.uniform(0.25, 0.5))
+
+    try:
+        if sb.driver.is_connected():
+            sb.driver.disconnect()
+        time.sleep(random.uniform(0.35, 0.65))
+        clicker(screen_x, screen_y, timeframe=random.uniform(0.38, 0.58))
+        print("✅ 已在断开 WebDriver 的状态下执行 PyAutoGUI 真人屏幕点击。")
+        time.sleep(2.5)
+    finally:
+        try:
+            if not sb.driver.is_connected():
+                sb.driver.reconnect(6.5)
+        finally:
+            ensure_driver_connected(sb, 1)
+    return True
+
+
+def run_gui_captcha_click(sb):
+    """使用 SeleniumBase 官方键盘/GUI 方法进行最后的 Turnstile 补充尝试。"""
+    attempts = [
+        ("uc_gui_handle_cf", {"frame": "#turnstile-timer-reset > div"}),
+        ("uc_gui_click_cf", {
+            "frame": "#turnstile-timer-reset > div", "retry": True
+        }),
+    ]
+    called = False
+    for method_name, kwargs in attempts:
+        method = getattr(sb, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            called = True
+            print(f"🖱️ 调用 SeleniumBase {method_name}() 补充验证...")
+            method(**kwargs)
+            time.sleep(1)
+            ensure_driver_connected(sb, 1)
+            if wait_for_turnstile_token(sb, 10, f"{method_name} 后"):
+                return True
+        except Exception as exc:
+            print(f"⚠️ {method_name}() 执行失败: {exc}")
+    return called and bool(get_turnstile_token(sb))
+
+
 def force_cdp_click_cf(sb):
-    """点击 Turnstile 复选框，并等待页面生成响应 Token。"""
+    """只使用断开 WebDriver 后的真人 GUI 点击，并等待页面生成响应 Token。"""
     token = get_turnstile_token(sb)
     if token:
         print("🎉 Cloudflare 已自动通过，无需再次点击。")
         return True
 
-    rect = get_turnstile_rect(sb)
-    if rect:
-        checkbox_offset = min(30.0, max(22.0, float(rect["width"]) * 0.08))
-        click_x = float(rect["left"]) + checkbox_offset
-        click_y = float(rect["top"]) + float(rect["height"]) / 2
-        print(f"📍 Turnstile 复选框坐标: X={click_x:.1f}, Y={click_y:.1f}")
-        try:
-            human_cdp_click(sb, click_x, click_y)
-            print("✅ 已执行带鼠标轨迹的 Turnstile 原生点击。")
-        except Exception as exc:
-            print(f"⚠️ CDP 原生点击异常: {exc}")
-    else:
-        print("⚠️ DOM 中未直接找到 Turnstile 外框，将使用 GUI 识别点击。")
+    # 弹窗刚出现时控件可能还只有加载圆点；等复选框完成渲染后再点。
+    print("⏳ 等待 Turnstile 复选框完成渲染...")
+    time.sleep(5)
+    if get_turnstile_token(sb):
+        print("🎉 Cloudflare 已在等待期间自动通过。")
+        return True
 
-    print("⏳ 等待 Cloudflare 生成 Token...")
-    for second in range(12):
-        time.sleep(1)
-        if get_turnstile_token(sb):
-            print(f"🎉 Turnstile 验证通过，{second + 1} 秒后捕获 Token。")
+    for gui_round in range(1, 3):
+        rect = get_turnstile_rect(sb)
+        if not rect:
+            print(f"⚠️ 第 {gui_round} 轮未找到 Turnstile 外框。")
+            break
+        try:
+            print(f"🖱️ 第 {gui_round} 轮：执行精确 PyAutoGUI 真人点击...")
+            native_gui_click_turnstile(sb, rect)
+        except Exception as exc:
+            print(f"⚠️ 第 {gui_round} 轮真人屏幕点击异常: {exc}")
+            break
+
+        save_shot(sb, f"turnstile_gui_round_{gui_round}.png")
+        if wait_for_turnstile_token(sb, 18, f"第 {gui_round} 轮 GUI 点击后"):
             return True
 
-    if run_gui_captcha_click(sb):
-        for second in range(15):
-            time.sleep(1)
-            if get_turnstile_token(sb):
-                print(f"🎉 GUI 点击后验证通过，{second + 1} 秒后捕获 Token。")
-                return True
+        source = (sb.get_page_source() or "").lower()
+        if "failure_retry" in source:
+            print("⚠️ Cloudflare 返回 failure_retry，等待控件刷新后重新真人点击。")
+        else:
+            print("⚠️ 本轮点击后 Token 仍为空，等待控件刷新后再试。")
+        time.sleep(4)
 
-    print("⚠️ 未能从顶层 DOM 读到 Token；仍将按真实页面流程点击 Just Reset，交由服务端确认。")
+    if run_gui_captcha_click(sb):
+        return True
+
+    print("⚠️ Turnstile 最终仍未生成 Token，本轮不会点击 Just Reset。")
     return False
 
 
@@ -517,7 +596,13 @@ def main():
                 print("👉 第二步：点击弹窗中的 Cloudflare 真人验证框...")
                 token_ready = force_cdp_click_cf(sb)
                 if not token_ready:
-                    print("⚠️ 本地未读取到 Token，但继续点击 Just Reset 让服务端进行最终校验。")
+                    save_shot(sb, f"turnstile_token_not_ready_{attempt}.png")
+                    save_page_diagnostics(sb, f"turnstile_token_not_ready_{attempt}")
+                    last_error = "Turnstile 真人点击后仍未生成 Token"
+                    print(f"⚠️ {last_error}，刷新页面后获取新 challenge 重试。")
+                    continue
+
+                print("✅ 已确认 Turnstile Token 生成，现在才允许点击 Just Reset。")
 
                 # Turnstile 渲染或刷新可能替换弹窗 DOM，因此提交前重新定位按钮。
                 confirm_btn = find_just_reset_button(sb, 12)
