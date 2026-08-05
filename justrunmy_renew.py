@@ -343,8 +343,8 @@ def save_page_diagnostics(sb, name):
                     text: (el.innerText || el.value || el.textContent || '').replace(/\\s+/g, ' ').trim(),
                     disabled: !!el.disabled
                 }))
-                .filter(item => item.text)
-                .slice(0, 40);
+                .filter(item => item.text && /reset|verify|captcha|cloudflare/i.test(item.text))
+                .slice(0, 15);
         """) or []
         print(f"🔎 当前可见操作控件: {controls}")
     except Exception as exc:
@@ -416,29 +416,9 @@ def native_gui_click_turnstile(sb, rect):
 
 
 def run_gui_captcha_click(sb):
-    """使用 SeleniumBase 官方键盘/GUI 方法进行最后的 Turnstile 补充尝试。"""
-    attempts = [
-        ("uc_gui_handle_cf", {"frame": "#turnstile-timer-reset > div"}),
-        ("uc_gui_click_cf", {
-            "frame": "#turnstile-timer-reset > div", "retry": True
-        }),
-    ]
-    called = False
-    for method_name, kwargs in attempts:
-        method = getattr(sb, method_name, None)
-        if not callable(method):
-            continue
-        try:
-            called = True
-            print(f"🖱️ 调用 SeleniumBase {method_name}() 补充验证...")
-            method(**kwargs)
-            time.sleep(1)
-            ensure_driver_connected(sb, 1)
-            if wait_for_turnstile_token(sb, 10, f"{method_name} 后"):
-                return True
-        except Exception as exc:
-            print(f"⚠️ {method_name}() 执行失败: {exc}")
-    return called and bool(get_turnstile_token(sb))
+    """不再叠加调用 SeleniumBase GUI 方法，避免重复获取 pyautogui.lock。"""
+    print("ℹ️ 已跳过 SeleniumBase 二次 GUI 备用点击，避免 pyautogui.lock 死锁。")
+    return False
 
 
 def force_cdp_click_cf(sb):
@@ -478,9 +458,7 @@ def force_cdp_click_cf(sb):
             print("⚠️ 本轮点击后 Token 仍为空，等待控件刷新后再试。")
         time.sleep(4)
 
-    if run_gui_captcha_click(sb):
-        return True
-
+    run_gui_captcha_click(sb)
     print("⚠️ Turnstile 最终仍未生成 Token，本轮不会点击 Just Reset。")
     return False
 
