@@ -74,8 +74,49 @@ def save_shot(sb, name):
         print(f"⚠️ 截图保存失败: {exc}")
 
 
+def ensure_driver_connected(sb, reconnect_time=1):
+    """UC/GUI 点击可能临时断开 WebDriver；DOM 操作前必须先重连。"""
+    try:
+        if hasattr(sb, "is_connected") and not sb.is_connected():
+            print("🔌 WebDriver 当前已断开，正在从 CDP 模式重连...")
+            sb.reconnect(reconnect_time)
+        return not hasattr(sb, "is_connected") or sb.is_connected()
+    except Exception as exc:
+        print(f"⚠️ WebDriver 重连失败: {exc}")
+        return False
+
+
+def open_uc_page(sb, url, reconnect_time=4):
+    """使用 UC 的重连打开方式，避免 sb.open() 将后续脚本留在 CDP evaluate 模式。"""
+    opener = getattr(sb.driver, "uc_open_with_reconnect", None)
+    if callable(opener):
+        opener(url, reconnect_time)
+    else:
+        sb.driver.get(url)
+    if not ensure_driver_connected(sb, 1):
+        raise RuntimeError(f"页面已打开但 WebDriver 无法重连: {url}")
+
+
+def execute_value_script(sb, script):
+    """执行返回普通值的 JS；兼容 WebDriver execute_script 与 CDP evaluate。"""
+    ensure_driver_connected(sb)
+    try:
+        return sb.driver.execute_script(script)
+    except Exception as webdriver_exc:
+        expression = script.strip()
+        if expression.startswith("return "):
+            expression = expression[len("return "):].strip()
+        if expression.endswith(";"):
+            expression = expression[:-1].rstrip()
+        try:
+            return sb.cdp.evaluate(expression)
+        except Exception:
+            raise webdriver_exc
+
+
 def get_turnstile_token(sb):
-    """读取页面中的 Turnstile 响应 Token。Selenium 脚本必须显式 return。"""
+    """读取页面中的 Turnstile 响应 Token。"""
+    ensure_driver_connected(sb)
     script = """
     return (() => {
         const selectors = [
@@ -94,48 +135,64 @@ def get_turnstile_token(sb):
     })();
     """
     try:
-        return sb.execute_script(script) or ""
+        return execute_value_script(sb, script) or ""
     except Exception:
         return ""
 
 
 def get_turnstile_rect(sb):
-    """返回 Turnstile 外层控件在浏览器视口内的矩形。"""
+    """返回 Turnstile 控件外层宿主在浏览器视口内的矩形。"""
+    ensure_driver_connected(sb)
     script = """
     return (() => {
+        const responseSelectors = [
+            'input[name="cf-turnstile-response"]',
+            'textarea[name="cf-turnstile-response"]',
+            'input[id^="cf-chl-widget-"][id$="_response"]'
+        ];
+        const candidates = [];
+        for (const selector of responseSelectors) {
+            const response = document.querySelector(selector);
+            if (response && response.parentElement) candidates.push(response.parentElement);
+        }
         const selectors = [
+            '#turnstile-timer-reset > div',
             'iframe[src*="challenges.cloudflare.com"]',
             'iframe[src*="/cdn-cgi/challenge-platform/"]',
             'iframe[title*="Cloudflare"]',
             '.cf-turnstile',
-            '[data-sitekey]'
+            '[data-sitekey]',
+            '#turnstile-timer-reset'
         ];
         for (const selector of selectors) {
-            for (const el of document.querySelectorAll(selector)) {
-                const r = el.getBoundingClientRect();
-                if (r.width >= 40 && r.height >= 30 &&
-                    r.bottom > 0 && r.right > 0 &&
-                    r.top < window.innerHeight && r.left < window.innerWidth) {
-                    return {
-                        left: r.left,
-                        top: r.top,
-                        width: r.width,
-                        height: r.height
-                    };
-                }
+            candidates.push(...document.querySelectorAll(selector));
+        }
+        for (const el of candidates) {
+            const r = el.getBoundingClientRect();
+            if (r.width >= 250 && r.height >= 50 &&
+                r.bottom > 0 && r.right > 0 &&
+                r.top < window.innerHeight && r.left < window.innerWidth) {
+                return {
+                    left: r.left,
+                    top: r.top,
+                    width: r.width,
+                    height: r.height
+                };
             }
         }
         return null;
     })();
     """
     try:
-        return sb.execute_script(script)
+        return execute_value_script(sb, script)
     except Exception:
         return None
 
 
 def human_cdp_click(sb, click_x, click_y):
     """通过 CDP 分步移动、停顿、按下和抬起，产生浏览器原生鼠标事件。"""
+    if not ensure_driver_connected(sb):
+        raise RuntimeError("WebDriver 未连接，无法发送原生鼠标事件")
     click_x = float(click_x)
     click_y = float(click_y)
     start_x = max(5.0, click_x - random.uniform(55, 110))
@@ -169,6 +226,7 @@ def human_cdp_click(sb, click_x, click_y):
 
 def click_element_like_human(sb, target):
     """对普通页面按钮执行带鼠标轨迹的原生坐标点击。"""
+    ensure_driver_connected(sb)
     element = None
     try:
         element = sb.find_element(target) if isinstance(target, str) else target
@@ -204,6 +262,7 @@ def click_element_like_human(sb, target):
 
 def find_just_reset_button(sb, timeout=10):
     """兼容 button、role=button、input、链接和开放 Shadow DOM。"""
+    ensure_driver_connected(sb)
     upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     lower = "abcdefghijklmnopqrstuvwxyz"
     xpaths = [
@@ -224,7 +283,8 @@ def find_just_reset_button(sb, timeout=10):
 
         # XPath 找不到时，递归扫描开放的 Shadow DOM。
         try:
-            element = sb.execute_script("""
+            ensure_driver_connected(sb)
+            element = sb.driver.execute_script("""
                 const wanted = 'just reset';
                 function findIn(root) {
                     const all = root.querySelectorAll('*');
@@ -261,6 +321,7 @@ def find_just_reset_button(sb, timeout=10):
 
 def save_page_diagnostics(sb, name):
     """保存 HTML，并在日志中输出当前可见按钮文字，方便定位页面变化。"""
+    ensure_driver_connected(sb)
     try:
         html_path = SCREENSHOT_DIR / f"{name}.html"
         html_path.write_text(sb.get_page_source() or "", encoding="utf-8")
@@ -269,7 +330,7 @@ def save_page_diagnostics(sb, name):
         print(f"⚠️ HTML 诊断保存失败: {exc}")
 
     try:
-        controls = sb.execute_script("""
+        controls = execute_value_script(sb, """
             return Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], input[type="button"], a'))
                 .filter(el => {
                     const r = el.getBoundingClientRect();
@@ -298,6 +359,8 @@ def run_gui_captcha_click(sb):
             try:
                 print(f"🖱️ 调用 SeleniumBase {method_name}() 点击验证框...")
                 method()
+                time.sleep(1)
+                ensure_driver_connected(sb, 1)
                 return True
             except Exception as exc:
                 print(f"⚠️ {method_name}() 执行失败: {exc}")
@@ -369,7 +432,7 @@ def main():
         try:
             sb.maximize_window()
             # 1. 打开首页并注入 Cookie
-            sb.open("https://justrunmy.app")
+            open_uc_page(sb, "https://justrunmy.app")
             sb.sleep(2)
 
             for cookie_pair in RAW_COOKIE.split(";"):
@@ -388,7 +451,7 @@ def main():
             print("🍪 已成功注入 Cookie")
 
             # 2. 直奔应用详情页
-            sb.open(APP_URL)
+            open_uc_page(sb, APP_URL)
             sb.wait_for_ready_state_complete(timeout=30)
             sb.sleep(5)
 
@@ -410,6 +473,7 @@ def main():
             for attempt in range(1, 4):
                 if attempt > 1:
                     print(f"🔄 第 {attempt} 次尝试：刷新页面以获取新的 Turnstile challenge...")
+                    ensure_driver_connected(sb)
                     sb.driver.refresh()
                     sb.wait_for_ready_state_complete(timeout=30)
                     sb.sleep(4)
