@@ -1,0 +1,47 @@
+name: Inspect JustRunMy Official MCP Tools
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-mcp-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      JUSTRUNMY_MCP_CONFIG: ${{ secrets.JUSTRUNMY_MCP_CONFIG }}
+      MCP_REPORT_PATH: mcp-diagnostics/mcp_tools.json
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate MCP secret
+        shell: bash
+        run: |
+          if [ -z "$JUSTRUNMY_MCP_CONFIG" ]; then
+            echo "::error::Missing repository secret JUSTRUNMY_MCP_CONFIG"
+            exit 1
+          fi
+
+      - name: Install dependency
+        run: python -m pip install --disable-pip-version-check requests
+
+      - name: List official MCP tools
+        run: python justrunmy_mcp_probe.py
+
+      - name: Upload sanitized MCP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: justrunmy-mcp-tools-${{ github.run_id }}
+          path: mcp-diagnostics/
+          if-no-files-found: warn
+          retention-days: 7
